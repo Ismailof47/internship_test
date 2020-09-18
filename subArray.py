@@ -1,0 +1,4 @@
+
+
+def findMaxSubArray(l):
+	pass
