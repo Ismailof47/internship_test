@@ -1,5 +1,3 @@
-
-
 def findMaxSubArray(l):
 	
 	max_arr = [l[0]]
@@ -21,5 +19,3 @@ def findMaxSubArray(l):
 
 
 
-l = [-2,1,-3,4,-1,2,1,-5,4]
-print(findMaxSubArray(l))
