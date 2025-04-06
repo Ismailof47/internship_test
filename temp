@@ -1,0 +1,14 @@
+curl -X POST "https://gigachat.devices.sberbank.ru/api/v1/chat/completions" \
+  -H "Authorization: Bearer YOUR_ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "GigaChat",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Напиши короткий стих про весну"
+      }
+    ],
+    "temperature": 0.7,
+    "max_tokens": 100
+  }'
