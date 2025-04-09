@@ -12,3 +12,481 @@ curl -X POST "https://gigachat.devices.sberbank.ru/api/v1/chat/completions" \
     "temperature": 0.7,
     "max_tokens": 100
   }'
+
+нужен python код на lang graph для создания ai агента 
+
+который помогает пользоваттелю извлечь из документа предметы закупки с основными характеристиками, (допустим у нас есть набор атрибутов которые должны быть извлечены) после извлечения агент валидатор   должен проверить что все нуны поля извлеклись, если же нет, попросить подсказку у пользователя, если пользователь дает подсказку то провести еще одну попытку извлечения и валидации, если пользователь говорит что в нужном документе нет неообходимой информации дать возможность ему ввести необходимые данные, после проверить валидатором что все в порядке и завершить работу.
+
+подумай упустил ли я что-то,    предложи архитектуруы и реализуй
+
+from typing import Dict, List, Optional, Any, TypedDict, Literal
+from enum import Enum
+import json
+import os
+import logging
+import datetime
+
+from langgraph.graph import StateGraph, END
+from langgraph.prebuilt import ToolNode
+from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_openai import ChatOpenAI
+
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(f"extraction_agent_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("extraction_agent")
+
+# Определение структур данных
+class AttributeStatus(str, Enum):
+    EXTRACTED = "extracted"
+    MISSING = "missing"
+    MANUALLY_ENTERED = "manually_entered"
+
+class ExtractedAttribute(TypedDict):
+    name: str
+    value: str
+    status: AttributeStatus
+    confidence: float
+
+class State(TypedDict):
+    """Состояние рабочего процесса агента"""
+    document_text: str
+    attributes_to_extract: List[str]
+    extracted_data: Dict[str, ExtractedAttribute]
+    missing_attributes: List[str]
+    user_hints: Dict[str, str]
+    extraction_attempts: int
+    current_phase: Literal["extraction", "validation", "user_interaction", "manual_input", "final_validation", "complete"]
+    messages: List[Any]
+
+# Настройка LLM
+llm = ChatOpenAI(model="gpt-4", temperature=0)
+
+# Определение узлов графа
+
+# 1. Узел для извлечения данных из документа
+def extract_data(state: State) -> State:
+    """Извлекает атрибуты предметов закупки из документа"""
+    logger.info(f"НАЧАЛО ИЗВЛЕЧЕНИЯ ДАННЫХ (Попытка #{state['extraction_attempts'] + 1})")
+    logger.info(f"Извлекаемые атрибуты: {', '.join(state['attributes_to_extract'])}")
+    if state["user_hints"]:
+        logger.info(f"Используются подсказки: {json.dumps(state['user_hints'], ensure_ascii=False)}")
+    
+    extract_prompt = ChatPromptTemplate.from_messages([
+        ("system", """Вы - эксперт по извлечению информации из документов закупок. 
+                    Ваша задача - найти и извлечь указанные атрибуты из текста документа.
+                    Для каждого атрибута укажите извлеченное значение и вашу уверенность (от 0 до 1).
+                    Если атрибут не найден, укажите это явно."""),
+        ("human", """Ниже представлен текст документа закупки. Пожалуйста, извлеките следующие атрибуты:
+                  {attributes_to_extract}
+                  
+                  {hints_text}
+                  
+                  Документ:
+                  {document_text}
+                  
+                  Представьте результат в JSON формате:
+                  {{
+                      "attribute_name": {{"value": "extracted_value", "confidence": confidence_score}},
+                      ...
+                  }}""")
+    ])
+    
+    # Подготовка подсказок, если они есть
+    hints_text = ""
+    if state["user_hints"]:
+        hints_text = "Дополнительные подсказки от пользователя:\n"
+        for attr, hint in state["user_hints"].items():
+            hints_text += f"- Для '{attr}': {hint}\n"
+    
+    # Вызов LLM для извлечения данных
+    logger.info("Вызов LLM для извлечения данных...")
+    extraction_response = llm.invoke(
+        extract_prompt.format(
+            attributes_to_extract=", ".join(state["attributes_to_extract"]),
+            document_text=state["document_text"],
+            hints_text=hints_text
+        )
+    )
+    
+    # Обработка ответа LLM
+    try:
+        # Находим JSON в ответе
+        response_text = extraction_response.content
+        logger.debug(f"Ответ LLM: {response_text[:200]}...")
+        
+        start_idx = response_text.find("{")
+        end_idx = response_text.rfind("}") + 1
+        if start_idx >= 0 and end_idx > start_idx:
+            json_str = response_text[start_idx:end_idx]
+            extracted_items = json.loads(json_str)
+            logger.info(f"Успешно извлечены данные в формате JSON")
+        else:
+            extracted_items = {}
+            logger.warning("Не удалось найти JSON в ответе LLM")
+        
+        # Обновляем данные о извлеченных атрибутах
+        extracted_count = 0
+        for attr in state["attributes_to_extract"]:
+            if attr in extracted_items and extracted_items[attr]["confidence"] > 0.5:
+                state["extracted_data"][attr] = {
+                    "name": attr,
+                    "value": extracted_items[attr]["value"],
+                    "status": AttributeStatus.EXTRACTED,
+                    "confidence": extracted_items[attr]["confidence"]
+                }
+                extracted_count += 1
+                logger.info(f"Извлечен атрибут '{attr}': '{extracted_items[attr]['value']}' (уверенность: {extracted_items[attr]['confidence']})")
+            else:
+                # Если атрибут не найден или низкая уверенность
+                if attr not in state["extracted_data"]:
+                    state["extracted_data"][attr] = {
+                        "name": attr,
+                        "value": "",
+                        "status": AttributeStatus.MISSING,
+                        "confidence": 0.0
+                    }
+                    logger.warning(f"Атрибут '{attr}' не найден или низкая уверенность")
+        
+        logger.info(f"Итоги извлечения: {extracted_count} из {len(state['attributes_to_extract'])} атрибутов успешно извлечены")
+    except Exception as e:
+        # Обработка ошибок при извлечении данных
+        logger.error(f"Ошибка при извлечении данных: {str(e)}", exc_info=True)
+        state["messages"].append(AIMessage(content=f"Произошла ошибка при извлечении данных: {str(e)}"))
+    
+    # Увеличиваем счетчик попыток извлечения
+    state["extraction_attempts"] += 1
+    state["current_phase"] = "validation"
+    logger.info(f"ЗАВЕРШЕНИЕ ИЗВЛЕЧЕНИЯ ДАННЫХ (Попытка #{state['extraction_attempts']})")
+    
+    return state
+
+# 2. Узел для валидации извлеченных данных
+def validate_data(state: State) -> State:
+    """Проверяет полноту извлеченных данных и определяет недостающие атрибуты"""
+    logger.info("НАЧАЛО ВАЛИДАЦИИ ДАННЫХ")
+    
+    state["missing_attributes"] = []
+    
+    for attr in state["attributes_to_extract"]:
+        if attr not in state["extracted_data"] or not state["extracted_data"][attr]["value"] or state["extracted_data"][attr]["status"] == AttributeStatus.MISSING:
+            state["missing_attributes"].append(attr)
+            logger.warning(f"Отсутствует атрибут: {attr}")
+    
+    if state["missing_attributes"]:
+        logger.info(f"Обнаружены недостающие атрибуты: {', '.join(state['missing_attributes'])}")
+        state["current_phase"] = "user_interaction"
+        logger.info("Переход к взаимодействию с пользователем")
+    else:
+        logger.info("Все требуемые атрибуты найдены. Переход к финальной валидации")
+        state["current_phase"] = "final_validation"
+    
+    logger.info("ЗАВЕРШЕНИЕ ВАЛИДАЦИИ ДАННЫХ")
+    return state
+
+# 3. Узел для взаимодействия с пользователем
+def get_user_input(state: State) -> State:
+    """Взаимодействует с пользователем для получения подсказок по недостающим атрибутам"""
+    logger.info("НАЧАЛО ВЗАИМОДЕЙСТВИЯ С ПОЛЬЗОВАТЕЛЕМ")
+    
+    missing_attrs = ", ".join(state["missing_attributes"])
+    
+    message = f"""
+    Не удалось извлечь следующие атрибуты: {missing_attrs}
+    
+    Пожалуйста, выберите один из вариантов:
+    1. Предоставьте подсказки для повторного извлечения (укажите 'подсказка: [атрибут] [ваша подсказка]')
+    2. Сообщите, что эти данные отсутствуют в документе и вы хотите ввести их вручную (введите 'ввести вручную')
+    """
+    
+    logger.info(f"Запрос к пользователю по недостающим атрибутам: {missing_attrs}")
+    state["messages"].append(AIMessage(content=message))
+    state["current_phase"] = "waiting_for_user"
+    
+    logger.info("ЗАВЕРШЕНИЕ ВЗАИМОДЕЙСТВИЯ С ПОЛЬЗОВАТЕЛЕМ (ожидание ввода)")
+    return state
+
+# 4. Узел для обработки ответа пользователя
+def process_user_response(state: State, user_response: str) -> State:
+    """Обрабатывает ответ пользователя"""
+    logger.info("НАЧАЛО ОБРАБОТКИ ОТВЕТА ПОЛЬЗОВАТЕЛЯ")
+    logger.info(f"Получен ответ пользователя: '{user_response}'")
+    
+    user_response = user_response.strip().lower()
+    
+    if user_response.startswith("подсказка:"):
+        # Парсинг подсказки
+        hint_text = user_response[len("подсказка:"):].strip()
+        parts = hint_text.split(" ", 1)
+        if len(parts) >= 2:
+            attr = parts[0].strip()
+            hint = parts[1].strip()
+            state["user_hints"][attr] = hint
+            logger.info(f"Получена подсказка для атрибута '{attr}': '{hint}'")
+            state["messages"].append(AIMessage(content=f"Получена подсказка для атрибута '{attr}'. Пробую извлечь данные снова."))
+            state["current_phase"] = "extraction"
+            logger.info("Переход к повторному извлечению данных")
+        else:
+            logger.warning("Неверный формат подсказки")
+            state["messages"].append(AIMessage(content="Не удалось разобрать подсказку. Пожалуйста, используйте формат 'подсказка: [атрибут] [ваша подсказка]'"))
+            state["current_phase"] = "user_interaction"
+    
+    elif user_response == "ввести вручную":
+        logger.info("Пользователь выбрал ручной ввод данных")
+        state["messages"].append(AIMessage(content="Пожалуйста, введите отсутствующие данные в формате 'атрибут: значение' по одному за раз."))
+        state["current_phase"] = "manual_input"
+    
+    else:
+        logger.warning(f"Неизвестный формат ответа: '{user_response}'")
+        state["messages"].append(AIMessage(content="Не удалось распознать ваш ответ. Пожалуйста, выберите один из предложенных вариантов."))
+        state["current_phase"] = "user_interaction"
+    
+    logger.info("ЗАВЕРШЕНИЕ ОБРАБОТКИ ОТВЕТА ПОЛЬЗОВАТЕЛЯ")
+    return state
+
+# 5. Узел для ручного ввода данных
+def handle_manual_input(state: State, user_input: str) -> State:
+    """Обрабатывает ручной ввод данных от пользователя"""
+    logger.info("НАЧАЛО ОБРАБОТКИ РУЧНОГО ВВОДА")
+    logger.info(f"Получен ввод: '{user_input}'")
+    
+    user_input = user_input.strip()
+    
+    if ":" in user_input:
+        attr, value = user_input.split(":", 1)
+        attr = attr.strip()
+        value = value.strip()
+        
+        if attr in state["attributes_to_extract"]:
+            logger.info(f"Сохранение ручного ввода для атрибута '{attr}': '{value}'")
+            state["extracted_data"][attr] = {
+                "name": attr,
+                "value": value,
+                "status": AttributeStatus.MANUALLY_ENTERED,
+                "confidence": 1.0  # Максимальная уверенность для ручного ввода
+            }
+            
+            state["missing_attributes"].remove(attr) if attr in state["missing_attributes"] else None
+            
+            if state["missing_attributes"]:
+                next_missing = ", ".join(state["missing_attributes"])
+                logger.info(f"Осталось ввести атрибуты: {next_missing}")
+                state["messages"].append(AIMessage(content=f"Данные для '{attr}' сохранены. Осталось ввести: {next_missing}"))
+                state["current_phase"] = "manual_input"
+            else:
+                logger.info("Все атрибуты введены. Переход к финальной валидации")
+                state["messages"].append(AIMessage(content="Все необходимые данные получены. Приступаю к финальной валидации."))
+                state["current_phase"] = "final_validation"
+        else:
+            logger.warning(f"Указан неизвестный атрибут: '{attr}'")
+            state["messages"].append(AIMessage(content=f"Атрибут '{attr}' не входит в список требуемых атрибутов. Пожалуйста, введите один из следующих: {', '.join(state['missing_attributes'])}"))
+            state["current_phase"] = "manual_input"
+    else:
+        logger.warning("Неверный формат ввода данных")
+        state["messages"].append(AIMessage(content="Пожалуйста, используйте формат 'атрибут: значение'"))
+        state["current_phase"] = "manual_input"
+    
+    logger.info("ЗАВЕРШЕНИЕ ОБРАБОТКИ РУЧНОГО ВВОДА")
+    return state
+
+# 6. Узел для финальной валидации и завершения
+def final_validation(state: State) -> State:
+    """Выполняет финальную валидацию данных и формирует итоговый результат"""
+    logger.info("НАЧАЛО ФИНАЛЬНОЙ ВАЛИДАЦИИ")
+    
+    # Проверка полноты данных
+    all_complete = all(attr in state["extracted_data"] and state["extracted_data"][attr]["value"] for attr in state["attributes_to_extract"])
+    
+    if all_complete:
+        logger.info("Все данные успешно собраны. Формирование итогового отчета")
+        
+        # Формирование итогового отчета
+        report = "Извлечение данных успешно завершено!\n\n"
+        report += "Результаты:\n"
+        
+        for attr in state["attributes_to_extract"]:
+            item = state["extracted_data"][attr]
+            status_label = "Извлечено автоматически" if item["status"] == AttributeStatus.EXTRACTED else "Введено вручную"
+            confidence = f" (уверенность: {item['confidence']:.2f})" if item["status"] == AttributeStatus.EXTRACTED else ""
+            report += f"- {item['name']}: {item['value']} [{status_label}{confidence}]\n"
+            logger.info(f"Финальный результат для '{attr}': '{item['value']}' [{status_label}{confidence}]")
+        
+        # Сохранение результатов в JSON
+        result_filename = f"extraction_results_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        try:
+            with open(result_filename, 'w', encoding='utf-8') as f:
+                json.dump(state["extracted_data"], f, ensure_ascii=False, indent=2)
+            logger.info(f"Результаты сохранены в файл {result_filename}")
+            report += f"\nРезультаты также сохранены в файл {result_filename}"
+        except Exception as e:
+            logger.error(f"Ошибка при сохранении результатов: {str(e)}", exc_info=True)
+        
+        state["messages"].append(AIMessage(content=report))
+        state["current_phase"] = "complete"
+    else:
+        # На всякий случай, если что-то пропустили
+        missing = [attr for attr in state["attributes_to_extract"] if attr not in state["extracted_data"] or not state["extracted_data"][attr]["value"]]
+        state["missing_attributes"] = missing
+        logger.warning(f"Обнаружены незаполненные атрибуты: {', '.join(missing)}")
+        state["messages"].append(AIMessage(content=f"Обнаружены незаполненные атрибуты: {', '.join(missing)}. Пожалуйста, введите их вручную."))
+        state["current_phase"] = "manual_input"
+    
+    logger.info("ЗАВЕРШЕНИЕ ФИНАЛЬНОЙ ВАЛИДАЦИИ")
+    return state
+
+# Функции для маршрутизации
+def route_based_on_phase(state: State) -> str:
+    """Определяет следующий узел на основе текущей фазы"""
+    logger.info(f"Маршрутизация: текущая фаза '{state['current_phase']}'")
+    return state["current_phase"]
+
+# Построение графа
+workflow = StateGraph(State)
+
+# Добавление узлов
+workflow.add_node("extraction", extract_data)
+workflow.add_node("validation", validate_data)
+workflow.add_node("user_interaction", get_user_input)
+workflow.add_node("manual_input", handle_manual_input)
+workflow.add_node("final_validation", final_validation)
+
+# Добавление ребер
+workflow.add_edge("extraction", "validation")
+workflow.add_edge("validation", "user_interaction")
+workflow.add_edge("validation", "final_validation")
+workflow.add_edge("user_interaction", "extraction")
+workflow.add_edge("user_interaction", "manual_input")
+workflow.add_edge("manual_input", "manual_input")
+workflow.add_edge("manual_input", "final_validation")
+workflow.add_edge("final_validation", "manual_input")
+workflow.add_edge("final_validation", END)
+
+# Настройка маршрутизации
+workflow.add_conditional_edges(
+    "validation",
+    route_based_on_phase,
+    {
+        "user_interaction": "user_interaction",
+        "final_validation": "final_validation"
+    }
+)
+
+workflow.add_conditional_edges(
+    "final_validation",
+    route_based_on_phase,
+    {
+        "manual_input": "manual_input",
+        "complete": END
+    }
+)
+
+# Компиляция графа
+app = workflow.compile()
+
+# Пример использования агента
+def run_document_extraction_agent(document_text: str, attributes_to_extract: List[str]):
+    """Запускает агента для извлечения данных из документа"""
+    logger.info("ЗАПУСК АГЕНТА ИЗВЛЕЧЕНИЯ ДАННЫХ")
+    logger.info(f"Количество атрибутов для извлечения: {len(attributes_to_extract)}")
+    logger.info(f"Размер документа: {len(document_text)} символов")
+    
+    # Инициализация начального состояния
+    initial_state = {
+        "document_text": document_text,
+        "attributes_to_extract": attributes_to_extract,
+        "extracted_data": {},
+        "missing_attributes": [],
+        "user_hints": {},
+        "extraction_attempts": 0,
+        "current_phase": "extraction",
+        "messages": []
+    }
+    
+    # Запуск рабочего процесса
+    result = {"state": initial_state}
+    
+    while True:
+        # Получение следующего узла на основе текущего состояния
+        if result["state"]["current_phase"] == "waiting_for_user":
+            # Ожидание ввода пользователя
+            user_input = input("Пожалуйста, введите ваш ответ: ")
+            logger.info(f"Пользовательский ввод: '{user_input}'")
+            result = app.invoke({"state": result["state"], "user_response": user_input})
+        elif result["state"]["current_phase"] == "manual_input":
+            # Ожидание ручного ввода данных
+            user_input = input("Введите данные (атрибут: значение): ")
+            logger.info(f"Ручной ввод данных: '{user_input}'")
+            result = app.invoke({"state": result["state"], "user_input": user_input})
+        elif result["state"]["current_phase"] == END or result["state"]["current_phase"] == "complete":
+            # Завершение работы
+            logger.info("Процесс извлечения данных завершен")
+            break
+        else:
+            # Автоматическое выполнение следующего шага
+            logger.info(f"Выполнение шага: {result['state']['current_phase']}")
+            result = app.invoke({"state": result["state"]})
+        
+        # Вывод сообщений
+        for message in result["state"]["messages"]:
+            if isinstance(message, AIMessage):
+                print(f"AI: {message.content}")
+        
+        # Очистка сообщений, чтобы не дублировать их
+        result["state"]["messages"] = []
+    
+    logger.info("ЗАВЕРШЕНИЕ РАБОТЫ АГЕНТА")
+    # Возврат финального состояния
+    return result["state"]
+
+# Пример использования
+if __name__ == "__main__":
+    # Пример документа закупки
+    sample_document = """
+    ТЕХНИЧЕСКОЕ ЗАДАНИЕ
+    на поставку компьютерной техники
+    
+    1. Предмет закупки: Ноутбук HP ProBook 450 G8
+    2. Количество: 10 шт.
+    3. Технические характеристики:
+        - Процессор: Intel Core i5-1135G7, 4 ядра, 8 потоков
+        - Оперативная память: 16 ГБ DDR4
+        - Накопитель: SSD 512 ГБ
+        - Дисплей: 15.6", 1920x1080, IPS
+        - Видеокарта: Intel Iris Xe Graphics
+    4. Гарантия: 36 месяцев
+    5. Срок поставки: 14 рабочих дней
+    """
+    
+    # Атрибуты для извлечения
+    attributes = [
+        "наименование_товара",
+        "количество",
+        "процессор",
+        "оперативная_память",
+        "накопитель",
+        "диагональ_экрана",
+        "гарантия",
+        "срок_поставки",
+        "стоимость"  # Этот атрибут отсутствует в документе
+    ]
+    
+    # Запуск агента
+    logger.info("====== НОВЫЙ СЕАНС ИЗВЛЕЧЕНИЯ ДАННЫХ ======")
+    final_state = run_document_extraction_agent(sample_document, attributes)
+    
+    # Вывод итоговых результатов
+    print("\nФинальные результаты:")
+    for attr in attributes:
+        if attr in final_state["extracted_data"]:
+            print(f"{attr}: {final_state['extracted_data'][attr]['value']}")
+        else:
+            print(f"{attr}: <не извлечено>")
+    
+    logger.info("====== СЕАНС ИЗВЛЕЧЕНИЯ ДАННЫХ ЗАВЕРШЕН ======")
