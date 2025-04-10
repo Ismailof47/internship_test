@@ -1,0 +1,293 @@
+from typing import TypedDict, List, Optional, Dict, Any
+from langgraph.graph import END, StateGraph
+from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnablePassthrough
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import TextLoader
+import json
+
+# Определяем структуру состояния
+class GraphState(TypedDict):
+    document_text: str
+    extracted_data: Optional[Dict[str, Any]]
+    missing_fields: List[str]
+    user_feedback: Optional[str]
+    user_input: Optional[Dict[str, Any]]
+    validation_passed: bool
+    messages: List[Dict[str, str]]  # Для истории диалога
+
+# Задаем ожидаемые атрибуты (можно настроить под ваши нужды)
+REQUIRED_ATTRIBUTES = {
+    "item_name": "Наименование предмета закупки",
+    "quantity": "Количество",
+    "unit": "Единица измерения",
+    "technical_specs": "Технические характеристики",
+    "delivery_date": "Срок поставки",
+    "budget": "Бюджетная стоимость"
+}
+
+# Инициализация состояния
+def init_state(document_path: str):
+    # Загрузка документа (пример для текстового файла)
+    loader = TextLoader(document_path)
+    documents = loader.load()
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    docs = text_splitter.split_documents(documents)
+    full_text = " ".join([doc.page_content for doc in docs])
+    
+    return {
+        "document_text": full_text,
+        "extracted_data": None,
+        "missing_fields": [],
+        "user_feedback": None,
+        "user_input": None,
+        "validation_passed": False,
+        "messages": [
+            {"role": "system", "content": "Я помогу вам извлечь данные о предметах закупки из документа."}
+        ]
+    }
+
+# Функция извлечения данных
+def extract_data(state: GraphState):
+    from langchain_community.chat_models import ChatOpenAI
+    
+    llm = ChatOpenAI(model="gpt-4", temperature=0)
+    
+    # Подготавливаем промпт для извлечения данных
+    prompt_template = """
+    Извлеките информацию о предметах закупки из следующего документа. 
+    Вам нужно найти следующие атрибуты:
+    {attributes}
+    
+    Верните ответ в формате JSON со следующей структурой:
+    {{
+        "item_name": "наименование",
+        "quantity": "количество",
+        "unit": "единица измерения",
+        "technical_specs": "технические характеристики",
+        "delivery_date": "срок поставки",
+        "budget": "бюджетная стоимость"
+    }}
+    
+    Если какой-то атрибут не найден, укажите null для этого поля.
+    
+    Документ:
+    {document}
+    """
+    
+    attributes_desc = "\n".join([f"- {key}: {desc}" for key, desc in REQUIRED_ATTRIBUTES.items()])
+    prompt = prompt_template.format(attributes=attributes_desc, document=state["document_text"])
+    
+    try:
+        # Вызываем LLM для извлечения данных
+        response = llm.invoke(prompt)
+        extracted_data = json.loads(response.content)
+        
+        # Обновляем историю сообщений
+        messages = state["messages"]
+        messages.append({"role": "assistant", "content": "Провел первоначальное извлечение данных из документа."})
+        
+        return {
+            "extracted_data": extracted_data,
+            "messages": messages
+        }
+    except Exception as e:
+        print(f"Ошибка при извлечении данных: {e}")
+        return {"extracted_data": None, "messages": state["messages"]}
+
+# Функция валидации
+def validate_data(state: GraphState):
+    extracted_data = state["extracted_data"]
+    missing_fields = []
+    
+    if not extracted_data:
+        missing_fields = list(REQUIRED_ATTRIBUTES.keys())
+    else:
+        for field, desc in REQUIRED_ATTRIBUTES.items():
+            if field not in extracted_data or extracted_data[field] is None:
+                missing_fields.append(field)
+    
+    messages = state["messages"]
+    if not missing_fields:
+        messages.append({"role": "assistant", "content": "Все необходимые данные успешно извлечены!"})
+        return {
+            "missing_fields": [],
+            "validation_passed": True,
+            "messages": messages
+        }
+    else:
+        missing_desc = ", ".join([REQUIRED_ATTRIBUTES[field] for field in missing_fields])
+        messages.append({
+            "role": "assistant", 
+            "content": f"Не удалось извлечь следующие данные: {missing_desc}. Пожалуйста, укажите, где в документе можно найти эту информацию или предоставьте ее самостоятельно."
+        })
+        return {
+            "missing_fields": missing_fields,
+            "validation_passed": False,
+            "messages": messages
+        }
+
+# Функция взаимодействия с пользователем
+def get_user_feedback(state: GraphState):
+    messages = state["messages"]
+    
+    # Выводим последнее сообщение ассистента
+    last_msg = next((msg for msg in reversed(messages) if msg["role"] == "assistant"), None)
+    if last_msg:
+        print(last_msg["content"])
+    
+    # Запрашиваем ввод пользователя
+    user_input = input("Ваш ответ: ")
+    
+    # Проверяем, не хочет ли пользователь ввести данные вручную
+    if user_input.lower().strip() == "ввести вручную":
+        manual_data = {}
+        print("Пожалуйста, введите недостающие данные:")
+        for field in state["missing_fields"]:
+            value = input(f"{REQUIRED_ATTRIBUTES[field]}: ")
+            manual_data[field] = value
+        
+        messages.append({"role": "user", "content": "Пользователь предпочел ввести данные вручную."})
+        return {
+            "user_feedback": None,
+            "user_input": manual_data,
+            "messages": messages
+        }
+    else:
+        messages.append({"role": "user", "content": user_input})
+        return {
+            "user_feedback": user_input,
+            "user_input": None,
+            "messages": messages
+        }
+
+# Функция обновления данных на основе пользовательского ввода
+def update_data(state: GraphState):
+    if state["user_input"]:
+        # Пользователь ввел данные вручную
+        updated_data = state["extracted_data"] or {}
+        for field, value in state["user_input"].items():
+            updated_data[field] = value
+        
+        messages = state["messages"]
+        messages.append({"role": "assistant", "content": "Данные были обновлены на основе ручного ввода."})
+        
+        return {
+            "extracted_data": updated_data,
+            "messages": messages
+        }
+    elif state["user_feedback"]:
+        # Пользователь дал подсказку - пробуем извлечь снова с учетом feedback
+        from langchain_community.chat_models import ChatOpenAI
+        
+        llm = ChatOpenAI(model="gpt-4", temperature=0)
+        
+        prompt_template = """
+        Ранее вы пытались извлечь следующие данные из документа:
+        {attributes}
+        
+        Но не смогли найти информацию для полей: {missing_fields}.
+        
+        Пользователь предоставил следующую подсказку: {feedback}
+        
+        Пожалуйста, попробуйте снова извлечь данные из документа с учетом этой подсказки.
+        Документ:
+        {document}
+        
+        Верните обновленные данные в формате JSON.
+        """
+        
+        missing_fields_desc = ", ".join([REQUIRED_ATTRIBUTES[field] for field in state["missing_fields"]])
+        prompt = prompt_template.format(
+            attributes=json.dumps(REQUIRED_ATTRIBUTES, indent=2, ensure_ascii=False),
+            missing_fields=missing_fields_desc,
+            feedback=state["user_feedback"],
+            document=state["document_text"]
+        )
+        
+        try:
+            response = llm.invoke(prompt)
+            updated_data = json.loads(response.content)
+            
+            # Сохраняем только обновленные поля
+            final_data = state["extracted_data"] or {}
+            for field in state["missing_fields"]:
+                if field in updated_data and updated_data[field] is not None:
+                    final_data[field] = updated_data[field]
+            
+            messages = state["messages"]
+            messages.append({"role": "assistant", "content": "Попытался извлечь данные с учетом вашей подсказки."})
+            
+            return {
+                "extracted_data": final_data,
+                "messages": messages
+            }
+        except Exception as e:
+            print(f"Ошибка при обновлении данных: {e}")
+            return state
+    else:
+        return state
+
+# Функция завершения работы
+def finalize(state: GraphState):
+    messages = state["messages"]
+    messages.append({"role": "assistant", "content": "Процесс извлечения данных завершен. Вот результаты:"})
+    messages.append({"role": "assistant", "content": json.dumps(state["extracted_data"], indent=2, ensure_ascii=False)})
+    
+    print("\nРезультаты извлечения данных:")
+    print(json.dumps(state["extracted_data"], indent=2, ensure_ascii=False))
+    
+    # Здесь можно добавить сохранение результатов в файл или БД
+    with open("extracted_data.json", "w", encoding="utf-8") as f:
+        json.dump(state["extracted_data"], f, ensure_ascii=False, indent=2)
+    
+    return {"messages": messages}
+
+# Создаем граф
+workflow = StateGraph(GraphState)
+
+# Добавляем узлы
+workflow.add_node("extract", extract_data)
+workflow.add_node("validate", validate_data)
+workflow.add_node("get_feedback", get_user_feedback)
+workflow.add_node("update", update_data)
+workflow.add_node("finalize", finalize)
+
+# Добавляем ребра
+workflow.set_entry_point("extract")
+
+workflow.add_edge("extract", "validate")
+workflow.add_conditional_edges(
+    "validate",
+    lambda state: "end" if state["validation_passed"] else "ask_user",
+    {
+        "end": "finalize",
+        "ask_user": "get_feedback"
+    }
+)
+workflow.add_edge("get_feedback", "update")
+workflow.add_edge("update", "validate")
+
+workflow.set_finish_point("finalize")
+
+# Компилируем граф
+app = workflow.compile()
+
+# Функция для запуска процесса
+def run_extraction_pipeline(document_path: str):
+    # Инициализируем состояние
+    initial_state = init_state(document_path)
+    
+    # Запускаем граф
+    final_state = app.invoke(initial_state)
+    
+    return final_state
+
+# Пример использования
+if __name__ == "__main__":
+    document_path = "path/to/your/document.txt"  # Укажите путь к вашему документу
+    print("Запуск процесса извлечения данных...")
+    result = run_extraction_pipeline(document_path)
+    print("\nПроцесс завершен успешно!")
