@@ -1,1 +1,140 @@
-1
+import random
+from typing import TypedDict, Optional, Literal
+from langgraph.graph import END, StateGraph
+from langgraph.graph.graph import CompiledGraph
+
+# Определяем типы данных
+class ProductState(TypedDict):
+    name: Optional[str]
+    price: Optional[float]
+    city: Optional[str]
+    missing_fields: list[str]
+    user_hint: Optional[str]
+
+# Имитация базы данных с продуктами (в реальности это может быть API, база данных и т.д.)
+product_database = [
+    {"name": "Смартфон X", "price": 599.99, "city": "Москва"},
+    {"name": "Ноутбук Pro", "price": 1299.99, "city": "Санкт-Петербург"},
+    {"name": "Наушники Elite", "price": 199.99, "city": "Казань"},
+]
+
+def tool_node(state: ProductState) -> ProductState:
+    """Нода, которая извлекает случайные атрибуты продукта"""
+    print("\n[Агент] Извлекаю данные о продукте...")
+    
+    # Выбираем случайный продукт из базы
+    product = random.choice(product_database)
+    
+    # Выбираем случайные 2 атрибута из 3
+    available_attrs = list(product.keys())
+    selected_attrs = random.sample(available_attrs, 2)
+    
+    # Обновляем состояние только выбранными атрибутами
+    for attr in selected_attrs:
+        state[attr] = product[attr]
+    
+    return state
+
+def validate_node(state: ProductState) -> Literal["complete", "missing_data"]:
+    """Нода валидации, проверяет все ли поля заполнены"""
+    missing = []
+    if state.get("name") is None:
+        missing.append("name")
+    if state.get("price") is None:
+        missing.append("price")
+    if state.get("city") is None:
+        missing.append("city")
+    
+    state["missing_fields"] = missing
+    
+    if not missing:
+        print("\n[Агент] Все данные успешно собраны!")
+        return "complete"
+    else:
+        print(f"\n[Агент] Не хватает данных: {', '.join(missing)}")
+        return "missing_data"
+
+def request_hint_node(state: ProductState) -> ProductState:
+    """Нода запроса подсказки у пользователя"""
+    missing_fields = state["missing_fields"]
+    print(f"\n[Агент] Пожалуйста, подскажите что-нибудь о продукте (например: {', '.join(missing_fields)})")
+    print("Или вы можете ввести недостающие данные напрямую в формате: поле=значение")
+    user_input = input("[Пользователь] ")
+    
+    # Пытаемся разобрать ввод пользователя
+    if "=" in user_input:
+        field, value = user_input.split("=", 1)
+        field = field.strip()
+        value = value.strip()
+        if field in missing_fields:
+            if field == "price":
+                try:
+                    state[field] = float(value)
+                except ValueError:
+                    print("[Агент] Цена должна быть числом, попробуйте еще раз")
+            else:
+                state[field] = value
+    else:
+        state["user_hint"] = user_input
+    
+    return state
+
+def final_node(state: ProductState) -> ProductState:
+    """Финальная нода, выводит результат"""
+    print("\n[Агент] Спасибо! Вот собранные данные о продукте:")
+    print(f"Название: {state['name']}")
+    print(f"Цена: {state['price']}")
+    print(f"Город: {state['city']}")
+    return state
+
+# Создаем граф workflow
+workflow = StateGraph(ProductState)
+
+# Добавляем ноды
+workflow.add_node("extract_data", tool_node)
+workflow.add_node("validate_data", validate_node)
+workflow.add_node("request_hint", request_hint_node)
+workflow.add_node("final", final_node)
+
+# Определяем edges
+workflow.add_conditional_edges(
+    "validate_data",
+    validate_node,
+    {
+        "complete": "final",
+        "missing_data": "request_hint",
+    }
+)
+
+workflow.add_edge("extract_data", "validate_data")
+workflow.add_edge("request_hint", "extract_data")
+workflow.add_edge("final", END)
+
+# Устанавливаем начальную и конечную ноды
+workflow.set_entry_point("extract_data")
+
+# Компилируем граф
+agent: CompiledGraph = workflow.compile()
+
+# Функция для запуска агента
+def run_agent():
+    print("Добро пожаловать! Я помогу вам получить информацию о продукте.")
+    print("Давайте начнем...\n")
+    
+    initial_state = {
+        "name": None,
+        "price": None,
+        "city": None,
+        "missing_fields": [],
+        "user_hint": None
+    }
+    
+    for step in agent.stream(initial_state):
+        for key, value in step.items():
+            if key == "__end__":
+                return
+
+if __name__ == "__main__":
+    run_agent()
+
+
