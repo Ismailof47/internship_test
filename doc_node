@@ -1,0 +1,152 @@
+from typing import TypedDict
+from langgraph.graph import StateGraph
+from langchain_core.runnables import RunnableLambda
+
+# 1. Определяем состояние графа
+class AgentState(TypedDict):
+    document_text: str
+    analysis_result: dict
+    error: str | None
+
+# 2. Предположим, у вас есть готовый pipeline doc_analyzer
+# (это может быть ваш существующий Chain, RunnableSequence или другой pipeline)
+def doc_analyzer_pipeline(document_text: str) -> dict:
+    """
+    Ваш существующий pipeline анализа документа
+    Примерная структура (замените на ваш реальный код):
+    """
+    from langchain_core.prompts import ChatPromptTemplate
+    from langchain_core.output_parsers import StrOutputParser
+    from langchain_community.chat_models import ChatOpenAI
+    
+    # Пример простого анализатора (замените на ваш)
+    prompt = ChatPromptTemplate.from_template(
+        "Проанализируй документ и извлеки ключевые пункты:\n\n{document}"
+    )
+    model = ChatOpenAI(model="gpt-3.5-turbo")
+    output_parser = StrOutputParser()
+    
+    chain = prompt | model | output_parser
+    return chain.invoke({"document": document_text})
+
+# 3. Создаем ноду для графа
+def analyze_document_node(state: AgentState):
+    try:
+        result = doc_analyzer_pipeline(state["document_text"])
+        return {"analysis_result": result, "error": None}
+    except Exception as e:
+        return {"analysis_result": None, "error": str(e)}
+
+# 4. Создаем и компилируем граф
+workflow = StateGraph(AgentState)
+
+# Добавляем единственную ноду
+workflow.add_node("analyze_document", analyze_document_node)
+
+# Устанавливаем начальную и конечную точки
+workflow.set_entry_point("analyze_document")
+workflow.set_finish_point("analyze_document")
+
+# Компилируем граф
+app = workflow.compile()
+
+# 5. Пример использования
+if __name__ == "__main__":
+    # Пример документа для анализа
+    sample_doc = """
+    Договор поставки №123 от 01.01.2024.
+    Поставщик: ООО "ТехноПром".
+    Покупатель: ООО "Розница".
+    Товар: Ноутбуки, 100 шт., цена за единицу 50000 руб.
+    Срок поставки: 30 дней с момента подписания договора.
+    """
+    
+    # Запускаем агента
+    result = app.invoke({"document_text": sample_doc, "analysis_result": None, "error": None})
+    
+    print("\nРезультат анализа документа:")
+    print(result["analysis_result"])
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+
+Если ваш doc_analyzer уже определен как LangChain Runnable:
+
+python
+Copy
+# Предположим, ваш анализатор уже определен как my_doc_analyzer
+from langchain_core.runnables import RunnableLambda
+
+# Просто оборачиваем в ноду
+def analyze_document_node(state: AgentState):
+    try:
+        result = state["doc_analyzer"].invoke(state["document_text"])
+        return {"analysis_result": result, "error": None}
+    except Exception as e:
+        return {"analysis_result": None, "error": str(e)}
+Если ваш анализатор требует дополнительных параметров:
+
+python
+Copy
+def create_analyze_node(doc_analyzer, config: dict):
+    def node_function(state: AgentState):
+        try:
+            # Передаем и текст документа, и конфиг
+            result = doc_analyzer.invoke({
+                "document": state["document_text"],
+                **config
+            })
+            return {"analysis_result": result, "error": None}
+        except Exception as e:
+            return {"analysis_result": None, "error": str(e)}
+    
+    return node_function
+
+# Создаем ноду с конфигурацией
+custom_analyzer_node = create_analyze_node(
+    doc_analyzer=my_doc_analyzer,
+    config={"mode": "detailed", "lang": "ru"}
+)
+Расширенная версия с обработкой ошибок
+python
+Copy
+from langgraph.graph import END, StateGraph
+from typing import TypedDict, Optional
+
+class AgentState(TypedDict):
+    document_text: str
+    analysis_result: Optional[dict]
+    error: Optional[str]
+    retry_count: int
+
+def analyze_with_retry(state: AgentState):
+    max_retries = 3
+    try:
+        result = doc_analyzer_pipeline(state["document_text"])
+        return {"analysis_result": result, "error": None}
+    except Exception as e:
+        if state["retry_count"] < max_retries:
+            return {"retry_count": state["retry_count"] + 1}
+        return {"error": str(e)}
+
+def handle_error(state: AgentState):
+    print(f"Ошибка анализа: {state['error']}")
+    # Можно добавить логику восстановления
+    return {"analysis_result": {"status": "failed", "reason": state["error"]}}
+
+# Создаем граф с ветвлением
+workflow = StateGraph(AgentState)
+
+workflow.add_node("analyze", analyze_with_retry)
+workflow.add_node("error_handler", handle_error)
+
+workflow.set_entry_point("analyze")
+
+workflow.add_conditional_edges(
+    "analyze",
+    lambda state: "error_handler" if state.get("error") else END,
+)
+
+workflow.add_edge("error_handler", END)
+
+app = workflow.compile()
