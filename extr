@@ -1,0 +1,86 @@
+from typing import Dict, Any, List, Optional
+from langgraph.graph import Graph
+
+class InteractiveExtractionAgent:
+    def __init__(self, required_keys: List[str]):
+        self.required_keys = required_keys
+        self.collected_data = {}
+
+        # Создаем граф
+        self.workflow = Graph()
+        self.workflow.add_node("extract_data", self.extract_data)
+        self.workflow.add_node("check_completion", self.check_completion)
+
+        self.workflow.set_entry_point("extract_data")
+
+        # Связи между нодами
+        self.workflow.add_edge("extract_data", "check_completion")
+
+        # Условный переход - продолжить или завершить
+        self.workflow.add_conditional_edges(
+            "check_completion",
+            self.decide_to_continue,
+            {
+                "continue": "extract_data",
+                "stop": "__end__"
+            }
+        )
+
+        self.app = self.workflow.compile()
+
+    def extract_data(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        """Запрашивает у пользователя недостающие данные"""
+        missing_keys = [k for k in self.required_keys if k not in state]
+
+        if not missing_keys:
+            return state
+
+        print(f"\nТребуются данные: {', '.join(missing_keys)}")
+        print("(можете ввести 'стоп' чтобы закончить)")
+
+        for key in missing_keys[:]:  # Используем копию для безопасного удаления
+            user_input = input(f"Введите значение для '{key}': ").strip()
+
+            if user_input.lower() == 'стоп':
+                state['__should_stop'] = True
+                return state
+
+            if user_input:
+                state[key] = user_input
+                missing_keys.remove(key)
+
+        return state
+
+    def check_completion(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        """Проверяет, все ли данные собраны"""
+        state['__all_collected'] = all(k in state for k in self.required_keys)
+        return state
+
+    def decide_to_continue(self, state: Dict[str, Any]) -> str:
+        """Решает, продолжать ли сбор данных"""
+        if state.get('__should_stop', False):
+            return "stop"
+
+        if state.get('__all_collected', False):
+            print("\nВсе необходимые данные собраны!")
+            return "stop"
+
+        return "continue"
+
+    def run(self):
+        """Запускает интерактивный процесс сбора данных"""
+        print(f"Агент сбора данных запущен. Требуемые поля: {', '.join(self.required_keys)}")
+        result = self.app.invoke({})
+
+        # Удаляем служебные поля перед выводом
+        result.pop('__should_stop', None)
+        result.pop('__all_collected', None)
+
+        print("\nИтоговые данные:")
+        for key, value in result.items():
+            print(f"{key}: {value}")
+
+# Пример использования
+if __name__ == "__main__":
+    agent = InteractiveExtractionAgent(["имя", "возраст", "город", "телефон"])
+    agent.run()
