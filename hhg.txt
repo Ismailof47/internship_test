@@ -1,0 +1,683 @@
+def get_full_path(self, cat4_text: str, fill_missing: bool = True) -> Optional[Tuple]:
+        """
+        Получить полный путь категории по значению cat4
+        
+        Args:
+            cat4_text: текст категории 4 уровня
+            fill_missing: заполнять пропуски специальными маркерами
+            
+        Returns:
+            Кортеж (cat1, cat2, cat3, cat4) или None если не найдено
+        """
+        rows = self.df[self.df['cat4'] == cat4_text]
+        if len(rows) == 0:
+            return None
+        
+        row = rows.iloc[0]
+        path = []
+        
+        for i in range(1, 5):
+            val = row[f'cat{i}']
+            if pd.notna(val):
+                path.append(val)
+            elif fill_missing:
+                path.append(f'__MISSING_CAT{i}__')
+            else:
+                path.append(None)
+        
+        return tuple(path)
+    
+    def analyze_hierarchy_gaps(self) -> Dict:
+        """
+        Анализ пропусков в иерархии
+        
+        Returns:
+            Статистика по пропускам в данных
+        """
+        analysis = {
+            'total_rows': len(self.df),
+            'level_stats': {},
+            'gap_patterns': {},
+            'examples': {}
+        }
+        
+        # Статистика по уровням
+        for level in range(1, 5):
+            col = f'cat{level}'
+            missing = self.df[col].isna().sum()
+            present = len(self.df) - missing
+            
+            analysis['level_stats'][level] = {
+                'present': int(present),
+                'missing': int(missing),
+                'percent_missing': float(missing / len(self.df) * 100)
+            }
+        
+        # Анализ паттернов пропусков
+        patterns = {}
+        for _, row in self.df.iterrows():
+            pattern = []
+            for level in range(1, 5):
+                if pd.notna(row[f'cat{level}']):
+                    pattern.append('1')
+                else:
+                    pattern.append('0')
+            
+            pattern_str = ''.join(pattern)
+            if pattern_str not in patterns:
+                patterns[pattern_str] = 0
+            patterns[pattern_str] += 1
+        
+        analysis['gap_patterns'] = patterns
+        
+        # Примеры записей с пропусками
+        examples = {}
+        for pattern, count in sorted(patterns.items(), key=lambda x: x[1], reverse=True)[:5]:
+            if '0' in pattern:  # Только паттерны с пропусками
+                mask = pd.Series([True] * len(self.df))
+                for i, bit in enumerate(pattern):
+                    col = f'cat{i+1}'
+                    if bit == '1':
+                        mask &= self.df[col].notna()
+                    else:
+                        mask &= self.df[col].isna()
+                
+                example_rows = self.df[mask].head(3)
+                examples[pattern] = {
+                    'count': count,
+                    'description': f"Паттерн {pattern} (1=есть, 0=пропуск)",
+                    'examples': example_rows[['cat1', 'cat2', 'cat3', 'cat4']].to_dict('records')
+                }
+        
+        analysis['examples'] = examples
+        
+        return analysis
+
+    def get_alternative_paths(self, target_level: int, known_values: Dict[int, str]) -> List[Tuple]:
+        """
+        Получить альтернативные пути с учетом известных значений и пропусков
+        
+        Args:
+            target_level: целевой уровень поиска
+            known_values: словарь {уровень: значение} с известными значениями
+            
+        Returns:
+            Список возможных путей для поиска потомков
+        """
+        if target_level <= 1:
+            return []
+        
+        paths = []
+        
+        # Создаем базовый путь
+        base_path = []
+        for i in range(1, target_level):
+            if i in known_values:
+                base_path.append(known_values[i])
+            else:
+                base_path.append(f'__MISSING_CAT{i}__')
+        
+        paths.append(tuple(base_path))
+        
+        # Генерируем альтернативные пути где некоторые известные значения заменены на пропуски
+        if len(known_values) > 1:
+            from itertools import combinations
+            
+            # Пробуем все комбинации замен известных значений на пропуски
+            known_levels = list(known_values.keys())
+            for r in range(1, len(known_levels)):
+                for levels_to_miss in combinations(known_levels, r):
+                    alt_path = []
+                    for i in range(1, target_level):
+                        if i in levels_to_miss:
+                            alt_path.append(f'__MISSING_CAT{i}__')
+                        elif i in known_values:
+                            alt_path.append(known_values[i])
+                        else:
+                            alt_path.append(f'__MISSING_CAT{i}__')
+                    
+                    paths.append(tuple(alt_path))
+        
+        return paths
+
+# Дополнительные функции для удобства работы с пропусками
+def print_hierarchy_analysis(searcher: HierarchicalCategorySearch):
+    """Печать анализа пропусков в иерархии"""
+    analysis = searcher.analyze_hierarchy_gaps()
+    
+    print("=== АНАЛИЗ ИЕРАРХИИ КАТЕГОРИЙ ===")
+    print(f"Всего записей: {analysis['total_rows']}")
+    print()
+    
+    print("Статистика по уровням:")
+    for level, stats in analysis['level_stats'].items():
+        print(f"  cat{level}: {stats['present']:,} есть, {stats['missing']:,} пропусков ({stats['percent_missing']:.1f}%)")
+    print()
+    
+    print("Топ-5 паттернов пропусков:")
+    for pattern, info in analysis['examples'].items():
+        print(f"  {info['description']}: {info['count']:,} записей")
+        if info['examples']:
+            print(f"    Пример: {info['examples'][0]}")
+    print()
+
+def demonstrate_gap_handling(searcher: HierarchicalCategorySearch, text_query: str):
+    """Демонстрация работы с пропусками"""
+    print(f"=== ДЕМОНСТРАЦИЯ ПОИСКА С ПРОПУСКАМИ ===")
+    print(f"Запрос: '{text_query}'")
+    print()
+    
+    # Каскадный поиск
+    results = searcher.find_cascade_matches(text_query, top_k=3)
+    
+    print("Результаты каскадного поиска:")
+    found_path = []
+    for level in range(1, 5):
+        if level in results and results[level]:
+            best_match = results[level][0]
+            found_path.append(best_match['text'])
+            print(f"  cat{level}: {best_match['text']} (score: {best_match['score']:.3f})")
+        else:
+            found_path.append("НЕ НАЙДЕНО")
+            print(f"  cat{level}: НЕ НАЙДЕНО")
+    
+    print()
+    
+    # Проверяем, есть ли такой путь в исходных данных
+    print("Проверка существования найденного пути в данных:")
+    
+    # Ищем записи которые могли бы соответствовать найденному пути
+    mask = pd.Series([True] * len(searcher.df))
+    for level, value in enumerate(found_path, 1):
+        if value != "НЕ НАЙДЕНО":
+            col_mask = (searcher.df[f'cat{level}'] == value) | searcher.df[f'cat{level}'].isna()
+            mask &= col_mask
+    
+    matching_rows = searcher.df[mask]
+    if len(matching_rows) > 0:
+        print(f"  Найдено {len(matching_rows)} совместимых записей в исходных данных")
+        print("  Примеры:")
+        for i, (_, row) in enumerate(matching_rows.head(3).iterrows()):
+            path_str = " -> ".join([str(row[f'cat{j}']) if pd.notna(row[f'cat{j}']) else 'ПРОПУСК' 
+                                   for j in range(1, 5)])
+            print(f"    {i+1}. {path_str}")
+    else:
+        print("  Совместимых записей не найдено")
+
+# Пример использования:
+"""
+# Инициализация с учетом пропусков
+searcher = HierarchicalCategorySearch(df, create_emb, "path/to/save")
+
+# Анализ структуры данных
+print_hierarchy_analysis(searcher)
+
+# Построение индексов с учетом пропусков
+searcher.build_indexes()
+
+# Демонстрация работы с пропусками
+demonstrate_gap_handling(searcher, "ваш поисковый запрос")
+
+# Каскадный поиск с обработкой пропусков
+results = searcher.find_cascade_matches("текст запроса", skip_empty_levels=True)
+
+# Результат покажет найденные категории для каждого уровня:
+print("Найденный иерархический путь:")
+for level in range(1, 5):
+    if level in results and results[level]:
+        best = results[level][0]
+        print(f"cat{level}: {best['text']} (уверенность: {best['score']:.3f})")
+    else:
+        print(f"cat{level}: ПРОПУСК")
+
+# Поиск на конкретном уровне с учетом пропусков
+level3_results = searcher.find_single_level(
+    "текст", 
+    level=3, 
+    parent_path=("найденная_cat1", "__MISSING_CAT2__"),  # cat2 пропущена
+    handle_missing=True
+)
+
+# Получение полного пути с заполнением пропусков
+full_path = searcher.get_full_path("некоторая_cat4", fill_missing=True)
+print(f"Полный путь: {full_path}")
+# Результат может быть: ('cat1_value', '__MISSING_CAT2__', 'cat3_value', 'cat4_value')
+"""import pandas as pd
+import numpy as np
+import faiss
+import pickle
+import os
+from typing import List, Dict, Tuple, Optional
+from pathlib import Path
+
+class HierarchicalCategorySearch:
+    def __init__(self, df: pd.DataFrame, create_emb_func, path_save: str):
+        """
+        Инициализация системы иерархического поиска категорий
+        
+        Args:
+            df: DataFrame с колонками cat1, cat2, cat3, cat4
+            create_emb_func: функция для создания эмбеддингов create_emb(texts) -> embeddings
+            path_save: путь для сохранения индексов
+        """
+        self.df = df.copy()
+        self.create_emb = create_emb_func
+        self.path_save = Path(path_save)
+        self.path_save.mkdir(parents=True, exist_ok=True)
+        
+        # Словари для хранения индексов и текстов для каждого уровня
+        self.indexes = {}
+        self.texts = {}
+        self.hierarchy_map = {}  # для связи между уровнями
+        
+    def _get_valid_parent_path(self, row: pd.Series, target_level: int) -> Optional[Tuple]:
+        """
+        Получить валидный путь к родителю для заданного уровня, учитывая пропуски
+        
+        Args:
+            row: строка DataFrame
+            target_level: целевой уровень (2, 3, 4)
+            
+        Returns:
+            Кортеж с валидными значениями родительских категорий или None
+        """
+        parent_values = []
+        for i in range(1, target_level):
+            val = row[f'cat{i}']
+            if pd.notna(val):
+                parent_values.append(val)
+            else:
+                # Если есть пропуск, используем специальный маркер
+                parent_values.append(f'__MISSING_CAT{i}__')
+        
+        return tuple(parent_values) if parent_values else None
+    
+    def build_indexes(self):
+        """Построение FAISS индексов для всех уровней категорий с учетом пропусков"""
+        print("Начинаем построение индексов...")
+        print("Анализируем структуру данных...")
+        
+        # Анализируем пропуски в данных
+        missing_stats = {}
+        for level in range(1, 5):
+            missing_count = self.df[f'cat{level}'].isna().sum()
+            total_count = len(self.df)
+            missing_stats[level] = {
+                'missing': missing_count,
+                'total': total_count,
+                'percent': (missing_count / total_count) * 100
+            }
+            print(f"cat{level}: {missing_count}/{total_count} пропусков ({missing_stats[level]['percent']:.1f}%)")
+        
+        for level in range(1, 5):  # cat1, cat2, cat3, cat4
+            cat_col = f'cat{level}'
+            print(f"\nОбрабатываем уровень {cat_col}...")
+            
+            # Получаем уникальные категории для текущего уровня (только непустые)
+            if level == 1:
+                # Для первого уровня берем все уникальные cat1
+                unique_cats = self.df[cat_col].dropna().unique()
+                parent_info = None
+            else:
+                # Для остальных уровней создаем mapping с учетом пропусков
+                # Берем только строки где текущий уровень не пустой
+                valid_rows = self.df[self.df[cat_col].notna()].copy()
+                unique_cats = valid_rows[cat_col].unique()
+                
+                # Создаем mapping родитель -> дети с учетом пропусков
+                parent_info = {}
+                
+                for _, row in valid_rows.iterrows():
+                    # Получаем валидный путь к родителю
+                    parent_path = self._get_valid_parent_path(row, level)
+                    child = row[cat_col]
+                    
+                    if parent_path is not None:
+                        if parent_path not in parent_info:
+                            parent_info[parent_path] = []
+                        if child not in parent_info[parent_path]:
+                            parent_info[parent_path].append(child)
+                
+                print(f"  Найдено {len(parent_info)} уникальных родительских путей")
+            
+            # Создаем эмбеддинги для уникальных категорий
+            cat_texts = list(unique_cats)
+            if not cat_texts:
+                print(f"  Предупреждение: нет данных для уровня {cat_col}")
+                continue
+                
+            embeddings = self.create_emb(cat_texts)
+            
+            # Создаем FAISS индекс
+            dimension = embeddings.shape[1]
+            index = faiss.IndexFlatIP(dimension)  # Косинусное сходство
+            
+            # Нормализуем эмбеддинги для косинусного сходства
+            faiss.normalize_L2(embeddings)
+            index.add(embeddings.astype('float32'))
+            
+            # Сохраняем индекс и тексты
+            self.indexes[level] = index
+            self.texts[level] = cat_texts
+            self.hierarchy_map[level] = parent_info
+            
+            # Сохраняем на диск
+            index_path = self.path_save / f'index_cat{level}.faiss'
+            texts_path = self.path_save / f'texts_cat{level}.pkl'
+            hierarchy_path = self.path_save / f'hierarchy_cat{level}.pkl'
+            
+            faiss.write_index(index, str(index_path))
+            with open(texts_path, 'wb') as f:
+                pickle.dump(cat_texts, f)
+            with open(hierarchy_path, 'wb') as f:
+                pickle.dump(parent_info, f)
+            
+            print(f"  Уровень {cat_col}: {len(cat_texts)} категорий, индекс сохранен")
+        
+        print("\nПостроение индексов завершено!")
+    
+    def load_indexes(self):
+        """Загрузка сохраненных индексов"""
+        print("Загружаем индексы...")
+        
+        for level in range(1, 5):
+            index_path = self.path_save / f'index_cat{level}.faiss'
+            texts_path = self.path_save / f'texts_cat{level}.pkl'
+            hierarchy_path = self.path_save / f'hierarchy_cat{level}.pkl'
+            
+            if index_path.exists() and texts_path.exists():
+                # Загружаем индекс
+                self.indexes[level] = faiss.read_index(str(index_path))
+                
+                # Загружаем тексты
+                with open(texts_path, 'rb') as f:
+                    self.texts[level] = pickle.load(f)
+                
+                # Загружаем иерархию
+                if hierarchy_path.exists():
+                    with open(hierarchy_path, 'rb') as f:
+                        self.hierarchy_map[level] = pickle.load(f)
+                else:
+                    self.hierarchy_map[level] = None
+                
+                print(f"Загружен уровень cat{level}: {len(self.texts[level])} категорий")
+            else:
+                raise FileNotFoundError(f"Индекс для уровня cat{level} не найден")
+        
+        print("Загрузка индексов завершена!")
+    
+    def _build_current_path(self, found_results: Dict, level: int) -> Tuple:
+        """
+        Построить текущий путь с учетом пропусков и найденных результатов
+        
+        Args:
+            found_results: словарь с результатами поиска по уровням
+            level: текущий уровень
+            
+        Returns:
+            Кортеж с путем к родителю для следующего уровня
+        """
+        path_elements = []
+        
+        for i in range(1, level):
+            if i in found_results and found_results[i]:
+                # Есть найденное значение на этом уровне
+                path_elements.append(found_results[i][0]['text'])
+            else:
+                # Пропуск на этом уровне
+                path_elements.append(f'__MISSING_CAT{i}__')
+        
+        return tuple(path_elements)
+
+    def find_cascade_matches(self, text_exp: str, top_k: int = 5, skip_empty_levels: bool = True) -> Dict:
+        """
+        Каскадный поиск по всем уровням категорий с учетом пропусков
+        
+        Args:
+            text_exp: входной текст для поиска
+            top_k: количество ближайших соседей для поиска
+            skip_empty_levels: пропускать уровни без результатов
+            
+        Returns:
+            Словарь с результатами поиска по каждому уровню
+        """
+        results = {}
+        
+        # Создаем эмбеддинг для входного текста
+        query_embedding = self.create_emb([text_exp])
+        faiss.normalize_L2(query_embedding)
+        
+        print(f"Начинаем каскадный поиск для: '{text_exp}'")
+        
+        for level in range(1, 5):
+            print(f"Поиск на уровне cat{level}...")
+            
+            # Проверяем, есть ли индекс для этого уровня
+            if level not in self.indexes or not self.texts[level]:
+                print(f"  Пропускаем уровень cat{level} - нет данных")
+                results[level] = []
+                continue
+            
+            if level == 1:
+                # Для первого уровня ищем среди всех cat1
+                index = self.indexes[level]
+                texts = self.texts[level]
+                
+                scores, indices = index.search(query_embedding.astype('float32'), top_k)
+                
+                matches = []
+                for score, idx in zip(scores[0], indices[0]):
+                    if idx != -1:  # -1 означает, что совпадение не найдено
+                        matches.append({
+                            'text': texts[idx],
+                            'score': float(score),
+                            'index': int(idx)
+                        })
+                
+                results[level] = matches
+                print(f"  Найдено {len(matches)} совпадений")
+            
+            else:
+                # Для остальных уровней ищем среди потомков с учетом пропусков
+                if self.hierarchy_map[level] is None:
+                    results[level] = []
+                    continue
+                
+                # Строим текущий путь с учетом всех предыдущих результатов
+                current_parent_path = self._build_current_path(results, level)
+                
+                # Ищем потомков для всех возможных вариантов пути (с учетом пропусков)
+                possible_children = set()
+                
+                # Попробуем найти детей для текущего пути
+                if current_parent_path in self.hierarchy_map[level]:
+                    possible_children.update(self.hierarchy_map[level][current_parent_path])
+                
+                # Также попробуем варианты с пропусками на разных уровнях
+                if len(current_parent_path) > 1:
+                    # Попробуем варианты где некоторые промежуточные уровни пропущены
+                    for missing_levels in range(1, len(current_parent_path)):
+                        alt_path = list(current_parent_path)
+                        # Заменяем найденные значения на маркеры пропусков
+                        for i in range(missing_levels):
+                            if i < len(alt_path):
+                                alt_path[i] = f'__MISSING_CAT{i+1}__'
+                        
+                        alt_path_tuple = tuple(alt_path)
+                        if alt_path_tuple in self.hierarchy_map[level]:
+                            possible_children.update(self.hierarchy_map[level][alt_path_tuple])
+                
+                children = list(possible_children)
+                
+                if not children:
+                    print(f"  Нет потомков для пути: {current_parent_path}")
+                    if skip_empty_levels:
+                        results[level] = []
+                        continue
+                    else:
+                        # Ищем среди всех категорий этого уровня
+                        children = self.texts[level]
+                
+                # Находим индексы потомков в общем списке текстов
+                all_texts = self.texts[level]
+                child_indices = []
+                
+                for child in children:
+                    if child in all_texts:
+                        idx = all_texts.index(child)
+                        child_indices.append(idx)
+                
+                if not child_indices:
+                    results[level] = []
+                    continue
+                
+                # Получаем эмбеддинги только для потомков
+                index = self.indexes[level]
+                
+                # Ищем среди всех, но потом фильтруем только потомков
+                search_size = min(len(all_texts), max(top_k * 3, 50))
+                scores, indices = index.search(query_embedding.astype('float32'), search_size)
+                
+                matches = []
+                for score, idx in zip(scores[0], indices[0]):
+                    if idx != -1 and idx in child_indices:
+                        matches.append({
+                            'text': all_texts[idx],
+                            'score': float(score),
+                            'index': int(idx)
+                        })
+                        if len(matches) >= top_k:
+                            break
+                
+                results[level] = matches[:top_k]
+                print(f"  Найдено {len(matches)} совпадений среди {len(children)} потомков")
+        
+        return results
+    
+    def find_single_level(self, text_exp: str, level: int, 
+                         parent_path: Optional[Tuple] = None, top_k: int = 5,
+                         handle_missing: bool = True) -> List[Dict]:
+        """
+        Поиск на конкретном уровне с опциональным ограничением по родителю
+        
+        Args:
+            text_exp: входной текст
+            level: уровень категорий (1-4)
+            parent_path: путь к родительской категории
+            top_k: количество результатов
+            handle_missing: учитывать пропуски в иерархии
+            
+        Returns:
+            Список найденных совпадений
+        """
+        if level not in self.indexes:
+            raise ValueError(f"Индекс для уровня {level} не найден")
+        
+        query_embedding = self.create_emb([text_exp])
+        faiss.normalize_L2(query_embedding)
+        
+        index = self.indexes[level]
+        all_texts = self.texts[level]
+        
+        if level == 1 or parent_path is None:
+            # Поиск среди всех категорий уровня
+            scores, indices = index.search(query_embedding.astype('float32'), top_k)
+            
+            matches = []
+            for score, idx in zip(scores[0], indices[0]):
+                if idx != -1:
+                    matches.append({
+                        'text': all_texts[idx],
+                        'score': float(score),
+                        'index': int(idx)
+                    })
+            
+            return matches
+        
+        else:
+            # Поиск среди потомков конкретного родителя
+            hierarchy = self.hierarchy_map[level]
+            if hierarchy is None:
+                return []
+            
+            children = set()
+            
+            # Основной путь
+            if parent_path in hierarchy:
+                children.update(hierarchy[parent_path])
+            
+            # Если включена обработка пропусков, попробуем альтернативные пути
+            if handle_missing and len(parent_path) > 0:
+                # Генерируем альтернативные пути с пропусками
+                for i in range(len(parent_path)):
+                    alt_path = list(parent_path)
+                    alt_path[i] = f'__MISSING_CAT{i+1}__'
+                    alt_path_tuple = tuple(alt_path)
+                    
+                    if alt_path_tuple in hierarchy:
+                        children.update(hierarchy[alt_path_tuple])
+                
+                # Также попробуем путь где все предыдущие уровни помечены как пропущенные
+                missing_path = tuple(f'__MISSING_CAT{i+1}__' for i in range(len(parent_path)))
+                if missing_path in hierarchy:
+                    children.update(hierarchy[missing_path])
+            
+            children = list(children)
+            if not children:
+                return []
+            
+            # Поиск среди всех с последующей фильтрацией
+            search_size = min(len(all_texts), max(top_k * 3, 50))
+            scores, indices = index.search(query_embedding.astype('float32'), search_size)
+            
+            matches = []
+            for score, idx in zip(scores[0], indices[0]):
+                if idx != -1 and all_texts[idx] in children:
+                    matches.append({
+                        'text': all_texts[idx],
+                        'score': float(score),
+                        'index': int(idx)
+                    })
+                    if len(matches) >= top_k:
+                        break
+            
+            return matches[:top_k]
+    
+    def get_full_path(self, cat4_text: str) -> Optional[Tuple]:
+        """
+        Получить полный путь категории по значению cat4
+        
+        Args:
+            cat4_text: текст категории 4 уровня
+            
+        Returns:
+            Кортеж (cat1, cat2, cat3, cat4) или None если не найдено
+        """
+        row = self.df[self.df['cat4'] == cat4_text]
+        if len(row) > 0:
+            return tuple(row.iloc[0][['cat1', 'cat2', 'cat3', 'cat4']].values)
+        return None
+
+# Пример использования:
+"""
+# Инициализация
+searcher = HierarchicalCategorySearch(df, create_emb, "path/to/save")
+
+# Построение индексов (выполняется один раз)
+searcher.build_indexes()
+
+# Или загрузка существующих индексов
+searcher.load_indexes()
+
+# Каскадный поиск
+results = searcher.find_cascade_matches("ваш поисковый текст")
+
+# Результат будет содержать найденные категории для каждого уровня:
+for level, matches in results.items():
+    print(f"Уровень cat{level}:")
+    for match in matches:
+        print(f"  {match['text']} (score: {match['score']:.3f})")
+
+# Поиск на конкретном уровне
+level2_results = searcher.find_single_level("текст", level=2, parent_path=("найденная_cat1",))
+"""
