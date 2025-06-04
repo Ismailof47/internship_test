@@ -1,0 +1,585 @@
+
+# main.py
+import asyncio
+import json
+import logging
+from typing import List, Dict, Any, Optional
+from aiohttp import web, ClientSession
+from aiohttp_cors import setup as cors_setup, ResourceOptions
+import uvloop
+from pydantic import BaseModel, Field, ValidationError
+import numpy as np
+
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+class PredictRequest(BaseModel):
+    text: str = Field(..., min_length=1, max_length=10000)
+    top_k: int = Field(default=5, ge=1, le=100)
+
+
+class CategoryResult(BaseModel):
+    category: str
+    score: float
+
+
+class PredictResponse(BaseModel):
+    categories: List[CategoryResult]
+    processing_time: float
+
+
+class CategoryPredictorService:
+    """Веб-сервис для предсказания категорий по тексту"""
+    
+    def __init__(self, classifier_instance):
+        """
+        Args:
+            classifier_instance: Экземпляр вашего класса с методами:
+                - get_embedding(text: str) -> np.ndarray
+                - predict_category(text: str, top_k: int) -> List[tuple]
+                или
+                - faiss_index: faiss индекс
+                - map_id_to_category: dict маппинг id -> category
+        """
+        self.classifier = classifier_instance
+        self.app = None
+        
+    def _prepare_classifier_methods(self):
+        """Подготавливает методы для работы с классификатором"""
+        # Если у классификатора есть готовый метод predict_category
+        if hasattr(self.classifier, 'predict_category'):
+            self.predict_method = self.classifier.predict_category
+        else:
+            # Иначе создаем свой метод на основе faiss_index и map_id_to_category
+            self.predict_method = self._create_predict_method()
+    
+    def _create_predict_method(self):
+        """Создает метод предсказания если его нет в классификаторе"""
+        def predict_category(text: str, top_k: int = 5):
+            # Получаем эмбеддинг текста
+            embedding = self.classifier.get_embedding(text)
+            
+            # Нормализуем вектор если нужно
+            if len(embedding.shape) == 1:
+                embedding = embedding.reshape(1, -1)
+            
+            # Ищем похожие векторы в faiss
+            scores, indices = self.classifier.faiss_index.search(embedding, top_k)
+            
+            # Формируем результат
+            results = []
+            for score, idx in zip(scores[0], indices[0]):
+                if idx in self.classifier.map_id_to_category:
+                    category = self.classifier.map_id_to_category[idx]
+                    results.append((category, float(score)))
+            
+            return results
+        
+        return predict_category
+
+    async def predict_categories(self, request):
+        """Обработчик для предсказания категорий"""
+        start_time = asyncio.get_event_loop().time()
+        
+        try:
+            # Получаем данные из запроса
+            data = await request.json()
+            
+            # Валидируем входные данные
+            try:
+                predict_request = PredictRequest(**data)
+            except ValidationError as e:
+                return web.json_response(
+                    {"error": "Invalid request data", "details": e.errors()},
+                    status=400
+                )
+            
+            # Выполняем предсказание в отдельном потоке
+            loop = asyncio.get_event_loop()
+            predictions = await loop.run_in_executor(
+                None, 
+                self.predict_method,
+                predict_request.text,
+                predict_request.top_k
+            )
+            
+            # Формируем ответ
+            categories = [
+                CategoryResult(category=cat, score=score)
+                for cat, score in predictions
+            ]
+            
+            processing_time = asyncio.get_event_loop().time() - start_time
+            
+            response = PredictResponse(
+                categories=categories,
+                processing_time=processing_time
+            )
+            
+            return web.json_response(response.model_dump())
+            
+        except Exception as e:
+            logger.error(f"Error in predict_categories: {str(e)}")
+            return web.json_response(
+                {"error": "Internal server error", "message": str(e)},
+                status=500
+            )
+
+    async def health_check(self, request):
+        """Проверка здоровья сервиса"""
+        return web.json_response({
+            "status": "healthy",
+            "service": "category-predictor",
+            "version": "1.0.0"
+        })
+
+    async def get_info(self, request):
+        """Информация о сервисе"""
+        info = {
+            "service": "Category Predictor Service",
+            "endpoints": {
+                "POST /predict_category": "Предсказание категорий для текста",
+                "GET /health": "Проверка здоровья сервиса",
+                "GET /info": "Информация о сервисе"
+            },
+            "request_format": {
+                "text": "string (required, 1-10000 chars)",
+                "top_k": "integer (optional, default=5, max=100)"
+            }
+        }
+        return web.json_response(info)
+
+    def create_app(self):
+        """Создает aiohttp приложение"""
+        app = web.Application()
+        
+        # Подготавливаем методы классификатора
+        self._prepare_classifier_methods()
+        
+        # Добавляем маршруты
+        app.router.add_post('/predict_category', self.predict_categories)
+        app.router.add_get('/health', self.health_check)
+        app.router.add_get('/info', self.get_info)
+        
+        # Настраиваем CORS
+        cors = cors_setup(app, defaults={
+            "*": ResourceOptions(
+                allow_credentials=True,
+                expose_headers="*",
+                allow_headers="*",
+                allow_methods="*"
+            )
+        })
+        
+        # Добавляем CORS для всех маршрутов
+        for route in list(app.router.routes()):
+            cors.add(route)
+        
+        # Middleware для логирования
+        async def logging_middleware(request, handler):
+            start_time = asyncio.get_event_loop().time()
+            try:
+                response = await handler(request)
+                process_time = asyncio.get_event_loop().time() - start_time
+                logger.info(
+                    f"{request.method} {request.path} - "
+                    f"Status: {response.status} - "
+                    f"Time: {process_time:.3f}s"
+                )
+                return response
+            except Exception as e:
+                process_time = asyncio.get_event_loop().time() - start_time
+                logger.error(
+                    f"{request.method} {request.path} - "
+                    f"Error: {str(e)} - "
+                    f"Time: {process_time:.3f}s"
+                )
+                raise
+        
+        app.middlewares.append(logging_middleware)
+        
+        self.app = app
+        return app
+
+    def run(self, host='0.0.0.0', port=8080):
+        """Запускает сервер"""
+        if not self.app:
+            self.create_app()
+        
+        logger.info(f"Starting Category Predictor Service on {host}:{port}")
+        
+        # Используем uvloop для лучшей производительности
+        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+        
+        web.run_app(self.app, host=host, port=port)
+
+
+# config.py
+import os
+from typing import Dict, Any
+
+class Config:
+    """Конфигурация сервиса"""
+    
+    # Сервер
+    HOST = os.getenv('HOST', '0.0.0.0')
+    PORT = int(os.getenv('PORT', 8080))
+    
+    # Логирование
+    LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
+    
+    # Модель
+    MODEL_PATH = os.getenv('MODEL_PATH', './models/')
+    MAX_TEXT_LENGTH = int(os.getenv('MAX_TEXT_LENGTH', 10000))
+    MAX_TOP_K = int(os.getenv('MAX_TOP_K', 100))
+    DEFAULT_TOP_K = int(os.getenv('DEFAULT_TOP_K', 5))
+
+
+# run_service.py - Скрипт для запуска сервиса
+import sys
+import os
+sys.path.append(os.path.dirname(__file__))
+
+from main import CategoryPredictorService
+from config import Config
+
+# Импортируйте ваш класс классификатора
+# from your_classifier import YourCategoryClassifier
+
+def create_classifier():
+    """Создает и возвращает экземпляр вашего классификатора"""
+    # Замените на инициализацию вашего класса
+    # classifier = YourCategoryClassifier()
+    # return classifier
+    
+    # Пример заглушки
+    class YourCategoryClassifier:
+        def __init__(self):
+            import numpy as np
+            import faiss
+            
+            # Пример создания простого faiss индекса
+            d = 768  # размерность векторов
+            self.faiss_index = faiss.IndexFlatIP(d)
+            
+            # Добавляем несколько примерных векторов
+            vectors = np.random.rand(100, d).astype('float32')
+            self.faiss_index.add(vectors)
+            
+            # Создаем маппинг id -> category
+            self.map_id_to_category = {
+                i: f"category_{i % 10}" for i in range(100)
+            }
+        
+        def get_embedding(self, text: str):
+            import numpy as np
+            # Здесь должна быть ваша логика получения эмбеддинга
+            return np.random.rand(768).astype('float32')
+    
+    return YourCategoryClassifier()
+
+
+if __name__ == "__main__":
+    # Создаем классификатор
+    classifier = create_classifier()
+    
+    # Создаем и запускаем сервис
+    service = CategoryPredictorService(classifier)
+    service.run(host=Config.HOST, port=Config.PORT)
+
+
+# Dockerfile
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Устанавливаем системные зависимости
+RUN apt-get update && apt-get install -y \
+    gcc \
+    g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+# Копируем requirements и устанавливаем зависимости
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Копируем код приложения
+COPY . .
+
+# Создаем директорию для моделей
+RUN mkdir -p /app/models
+
+EXPOSE 8080
+
+# Запускаем сервис
+CMD ["python", "run_service.py"]
+
+
+# docker-compose.yml
+version: '3.8'
+
+services:
+  category-predictor:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - HOST=0.0.0.0
+      - PORT=8080
+      - LOG_LEVEL=INFO
+    volumes:
+      - ./models:/app/models
+      - ./logs:/app/logs
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+
+# Makefile
+.PHONY: install run test docker-build docker-run clean
+
+# Установка зависимостей
+install:
+	pip install -r requirements.txt
+
+# Запуск сервиса локально
+run:
+	python run_service.py
+
+# Тестирование
+test:
+	python test_client.py
+
+# Сборка Docker образа
+docker-build:
+	docker build -t category-predictor .
+
+# Запуск через Docker
+docker-run:
+	docker run -p 8080:8080 category-predictor
+
+# Запуск через docker-compose
+compose-up:
+	docker-compose up -d
+
+# Остановка docker-compose
+compose-down:
+	docker-compose down
+
+# Просмотр логов
+logs:
+	docker-compose logs -f
+
+# Очистка
+clean:
+	docker system prune -f
+	docker-compose down --volumes
+
+
+# README.md
+# Category Predictor Service
+
+Веб-сервис для предсказания категорий текста на основе FAISS индекса и эмбеддингов.
+
+## Особенности
+
+- Асинхронный веб-сервер на aiohttp
+- Поддержка CORS
+- Валидация входных данных с помощью Pydantic
+- Логирование запросов
+- Health check endpoint
+- Docker поддержка
+- Легкая интеграция с существующими классификаторами
+
+## Установка
+
+### Локальная установка
+
+```bash
+# Клонируйте проект
+git clone <your-repo>
+cd category-predictor-service
+
+# Установите зависимости
+pip install -r requirements.txt
+
+# Запустите сервис
+python run_service.py
+```
+
+### Docker
+
+```bash
+# Сборка образа
+make docker-build
+
+# Запуск через docker-compose
+make compose-up
+```
+
+## API Endpoints
+
+### POST /predict_category
+
+Предсказание категорий для текста.
+
+**Параметры запроса:**
+```json
+{
+  "text": "Текст для классификации",
+  "top_k": 5
+}
+```
+
+**Ответ:**
+```json
+{
+  "categories": [
+    {
+      "category": "category_name",
+      "score": 0.95
+    }
+  ],
+  "processing_time": 0.123
+}
+```
+
+### GET /health
+
+Проверка здоровья сервиса.
+
+### GET /info
+
+Информация о сервисе и доступных endpoints.
+
+## Интеграция с вашим классификатором
+
+Замените заглушку в `run_service.py`:
+
+```python
+def create_classifier():
+    # Импортируйте ваш класс
+    from your_module import YourCategoryClassifier
+    
+    # Создайте экземпляр с необходимыми параметрами
+    classifier = YourCategoryClassifier(
+        model_path="path/to/your/model",
+        faiss_index_path="path/to/faiss/index"
+    )
+    
+    return classifier
+```
+
+Ваш класс должен иметь один из следующих интерфейсов:
+
+**Вариант 1:** Готовый метод predict_category
+```python
+def predict_category(self, text: str, top_k: int = 5) -> List[tuple]:
+    # Возвращает список (category, score)
+    pass
+```
+
+**Вариант 2:** Отдельные компоненты
+```python
+def get_embedding(self, text: str) -> np.ndarray:
+    # Возвращает эмбеддинг текста
+    pass
+
+# И атрибуты:
+self.faiss_index  # FAISS индекс
+self.map_id_to_category  # dict: id -> category
+```
+
+## Конфигурация
+
+Переменные окружения:
+
+- `HOST` - хост сервера (по умолчанию: 0.0.0.0)
+- `PORT` - порт сервера (по умолчанию: 8080)
+- `LOG_LEVEL` - уровень логирования (по умолчанию: INFO)
+- `MODEL_PATH` - путь к моделям
+- `MAX_TEXT_LENGTH` - максимальная длина текста (по умолчанию: 10000)
+- `MAX_TOP_K` - максимальное значение top_k (по умолчанию: 100)
+
+## Тестирование
+
+```bash
+# Запустите сервис
+make run
+
+# В другом терминале запустите тесты
+make test
+```
+
+## Производство
+
+Для продакшен использования рекомендуется:
+
+1. Использовать gunicorn или подобный WSGI сервер
+2. Настроить nginx как reverse proxy
+3. Использовать внешнюю систему логирования
+4. Настроить мониторинг и алерты
+
+Пример запуска с gunicorn:
+```bash
+pip install gunicorn
+gunicorn -w 4 -k aiohttp.GunicornWebWorker run_service:create_app
+```
+
+Основные файлы:
+
+main.py - Основной код сервиса с классом CategoryPredictorService
+run_service.py - Скрипт для запуска с интеграцией вашего классификатора
+config.py - Конфигурация через переменные окружения
+test_client.py - Клиент для тестирования API
+requirements.txt - Зависимости Python
+Dockerfile и docker-compose.yml - Для контейнеризации
+Makefile - Удобные команды для сборки и запуска
+README.md - Подробная документация
+
+Ключевые особенности:
+
+Асинхронность: Использует aiohttp для высокой производительности
+Гибкая интеграция: Работает с любым классом, который имеет методы получения эмбеддингов и FAISS индекс
+Валидация: Проверка входных данных с помощью Pydantic
+CORS: Настроена поддержка CORS для веб-приложений
+Логирование: Подробное логирование всех запросов
+Health check: Endpoint для мониторинга
+Docker: Готовая контейнеризация
+
+API Endpoints:
+
+POST /predict_category - Основной endpoint для предсказания категорий
+GET /health - Проверка здоровья сервиса
+GET /info - Информация о сервисе
+
+Для интеграции с вашим классом:
+Замените заглушку в run_service.py на создание экземпляра вашего класса. Сервис поддерживает два варианта интеграции:
+
+Если у вас есть готовый метод predict_category - сервис будет использовать его напрямую
+Если у вас есть отдельные компоненты (get_embedding, faiss_index, map_id_to_category) - сервис создаст метод предсказания автоматически
+
+Для запуска просто выполните:
+bashpip install -r requirements.txt
+python run_service.py
+Сервис будет доступен по адресу http://localhost:8080/predict_categoryRetryClaude does not have the ability to run the code it generates yet.Claude can make mistakes. Please double-check responses.
+
+
+
+# requirements.txt
+"""
+aiohttp==3.9.3
+aiohttp-cors==0.7.0
+faiss-cpu==1.7.4
+numpy>=1.21.0
+pydantic==2.5.3
+uvloop==0.19.0
+"""
